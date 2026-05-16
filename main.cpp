@@ -7,30 +7,40 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
+// Linux Bluetooth Headers
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/hci.h>
 #include <bluetooth/hci_lib.h>
 
-// --- CONFIGURATION ---
+// ==========================================
+// 1. HARDWARE CONFIGURATION
+// ==========================================
 const char* BEACONS[3] = {
     "48:87:2D:7C:F1:07", // Beacon 1
     "48:87:2D:7C:F0:FF", // Beacon 2
     "48:87:2D:7C:F0:FC"  // Beacon 3
 };
 
+// Beacon physical locations in the room (X, Y, Z in meters)
+float BX[3] = {2.87f, 0.00f, 1.71f};
+float BY[3] = {0.00f, 0.00f, 1.71f};
+float BZ[3] = {2.03f, 4.67f, 1.77f}; // Height of the beacons (e.g., 5 meters high)
+
+// RF Calibration Constants
 float RSSI_AT_1M = -57.0f;
 float N_VALUE = 2.0f;
 
-// --- STATE ---
+// ==========================================
+// 2. ENGINE STATE & FILTERS
+// ==========================================
 struct TrackingState {
-    float x = 0.0f, y = 0.0f;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
     float d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
     int rssi1 = 0, rssi2 = 0, rssi3 = 0;
 };
 TrackingState state;
 std::mutex stateMutex;
 
-// --- KALMAN FILTER ---
 class PureKalman {
 public:
     float e_mea = 2.0f, e_est = 2.0f, q = 1.2f, last_est = 0.0f;
@@ -49,38 +59,77 @@ float rssiToMeters(int rssi) {
     return std::pow(10.0f, (RSSI_AT_1M - (float)rssi) / (10.0f * N_VALUE));
 }
 
-// --- MATH ---
+// ==========================================
+// 3. 3D GRADIENT DESCENT MATH ENGINE
+// ==========================================
 void executeTrilateration() {
-    float r1 = state.d1, r2 = state.d2, r3 = state.d3;
-    if (r1 == 0.0f || r2 == 0.0f || r3 == 0.0f) return;
+    float r[3] = {state.d1, state.d2, state.d3};
+    
+    // Require all 3 beacons to be active before solving 3D space
+    if (r[0] == 0.0f || r[1] == 0.0f || r[2] == 0.0f) return;
 
-    float x1 = 0.0f, y1 = 0.0f;
-    float x2 = 8.0f, y2 = 0.0f;
-    float x3 = 4.0f, y3 = 6.0f;
+    // Warm Start: Begin sliding from the last known coordinate
+    float px = state.x, py = state.y, pz = state.z;
+    
+    int iterations = 50; 
+    float learning_rate = 0.05f;
 
-    float A = 2.0f * x2 - 2.0f * x1;
-    float B = 2.0f * y2 - 2.0f * y1;
-    float C = (r1*r1) - (r2*r2) - (x1*x1) + (x2*x2) - (y1*y1) + (y2*y2);
-    float D = 2.0f * x3 - 2.0f * x2;
-    float E = 2.0f * y3 - 2.0f * y2;
-    float F = (r2*r2) - (r3*r3) - (x2*x2) + (x3*x3) - (y2*y2) + (y3*y3);
+    for (int step = 0; step < iterations; step++) {
+        float grad_x = 0.0f, grad_y = 0.0f, grad_z = 0.0f;
 
-    float denominator = (E * A - B * D);
-    if (std::abs(denominator) < 0.0001f) return;
+        for (int i = 0; i < 3; i++) {
+            float dx = px - BX[i];
+            float dy = py - BY[i];
+            float dz = pz - BZ[i];
+            float dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+            
+            // NaN Protection
+            if (dist < 0.001f) dist = 0.001f; 
+            
+            float error = dist - r[i];
+            
+            grad_x += 2.0f * error * (dx / dist);
+            grad_y += 2.0f * error * (dy / dist);
+            grad_z += 2.0f * error * (dz / dist);
+        }
 
-    state.x = (C * E - F * B) / denominator;
-    state.y = (C * D - A * F) / (B * D - A * E);
+        px -= learning_rate * grad_x;
+        py -= learning_rate * grad_y;
+        pz -= learning_rate * grad_z;
+
+        // GRAVITY / CEILING CONSTRAINT
+        // Force the coordinate to remain below the lowest hanging beacon
+        float lowest_beacon = BZ[0];
+        if (BZ[1] < lowest_beacon) lowest_beacon = BZ[1];
+        if (BZ[2] < lowest_beacon) lowest_beacon = BZ[2];
+        
+        if (pz > lowest_beacon) {
+            pz = lowest_beacon; 
+        }
+    }
+
+    state.x = px;
+    state.y = py;
+    state.z = pz;
 }
 
-// --- BLUETOOTH CORE ---
+// ==========================================
+// 4. BARE-METAL BLUETOOTH LISTENER
+// ==========================================
 void bluetoothSnifferThread() {
     int device_id = hci_get_route(NULL);
     int dd = hci_open_dev(device_id);
     
+    if (device_id < 0 || dd < 0) {
+        std::cerr << "CRITICAL: Could not open Bluetooth Device." << std::endl;
+        return;
+    }
+
+    // Force radio to unfiltered active scanning mode
     hci_le_set_scan_enable(dd, 0x00, 0x00, 1000); 
     uint16_t interval = htobs(0x0010), window = htobs(0x0010);
     hci_le_set_scan_parameters(dd, 0x00, interval, window, 0x00, 0x00, 1000);
-    hci_le_set_scan_enable(dd, 0x01, 0x00, 1000);
+    hci_le_set_scan_enable(dd, 0x01, 0x00, 1000); // 0x00 explicitly disables duplicate filtering
 
     struct hci_filter nf;
     hci_filter_clear(&nf);
@@ -89,7 +138,7 @@ void bluetoothSnifferThread() {
     setsockopt(dd, SOL_HCI, HCI_FILTER, &nf, sizeof(nf));
 
     uint8_t buf[HCI_MAX_FRAME_SIZE];
-    std::cout << "[BLE] Engine running. Dashboard available on port 8080.\n";
+    std::cout << "[BLE] 3D Engine running. Dashboard available on port 8080.\n";
 
     while (true) {
         int len = read(dd, buf, sizeof(buf));
@@ -105,6 +154,8 @@ void bluetoothSnifferThread() {
             le_advertising_info* info = (le_advertising_info*)ptr;
             char mac[18];
             ba2str(&info->bdaddr, mac);
+            
+            // RSSI signature is located precisely 1 byte after payload data
             int8_t rawRssi = (int8_t)info->data[info->length];
 
             std::lock_guard<std::mutex> lock(stateMutex);
@@ -128,11 +179,13 @@ void bluetoothSnifferThread() {
     }
 }
 
-// --- SMART WEB UI ---
+// ==========================================
+// 5. SMART WEB UI & HTTP SERVER
+// ==========================================
 const std::string HTML_PAGE = 
     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
     "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1.0'>"
-    "<title>C++ Tracker Dashboard</title><style>"
+    "<title>3D Tracker Dashboard</title><style>"
     "body{background-color:#121212;color:#E0E0E0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:20px;}"
     ".box{background-color:#1E1E1E;padding:20px;border-radius:12px;margin-bottom:15px;border:1px solid #333;}"
     "h1, h2{margin-top:0; color:#BB86FC;} .val{font-weight:bold;font-size:28px; color:#03DAC6;}"
@@ -141,10 +194,12 @@ const std::string HTML_PAGE =
     ".status-ready{background-color:#003314; color:#00FF66; border:1px solid #00FF66;}"
     ".b-off{color:#CF6679; font-weight:bold;} .b-on{color:#E0E0E0;}"
     "</style></head><body>"
-    "<h1>🔮 LumenTrack Engine</h1>"
+    "<h1>🔮 LumenTrack 3D Engine</h1>"
     "<div id='status' class='status-wait'>⚠️ WAITING FOR BEACONS</div>"
     "<div class='box'><h2>Stage Coordinates</h2>"
-    "X: <span id='x' class='val'>---</span><br>Y: <span id='y' class='val'>---</span></div>"
+    "X: <span id='x' class='val'>---</span><br>"
+    "Y: <span id='y' class='val'>---</span><br>"
+    "Z: <span id='z' class='val'>---</span></div>"
     "<div class='box'><h2>Hardware Status</h2><div id='b' style='font-family:monospace; font-size:18px; line-height:1.5;'>Loading...</div></div>"
     "<script>"
     "function formatB(name, dist, rssi) {"
@@ -156,13 +211,15 @@ const std::string HTML_PAGE =
     "let ready = (d.d1 > 0 && d.d2 > 0 && d.d3 > 0);"
     "let stat = document.getElementById('status');"
     "if(ready) {"
-    "  stat.className='status-ready'; stat.innerText='✅ TRILATERATION ACTIVE';"
+    "  stat.className='status-ready'; stat.innerText='✅ 3D TRILATERATION ACTIVE';"
     "  document.getElementById('x').innerText=d.x.toFixed(2) + 'm';"
     "  document.getElementById('y').innerText=d.y.toFixed(2) + 'm';"
+    "  document.getElementById('z').innerText=d.z.toFixed(2) + 'm';"
     "} else {"
     "  stat.className='status-wait'; stat.innerText='⚠️ WAITING FOR BEACONS';"
     "  document.getElementById('x').innerText='---';"
     "  document.getElementById('y').innerText='---';"
+    "  document.getElementById('z').innerText='---';"
     "}"
     "document.getElementById('b').innerHTML = formatB('B1', d.d1, d.r1) + formatB('B2', d.d2, d.r2) + formatB('B3', d.d3, d.r3);"
     "}catch(e){}}setInterval(poll,100);"
@@ -177,8 +234,11 @@ void httpServerThread() {
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(8080);
-    bind(server_fd, (struct sockaddr*)&address, sizeof(address));
-    listen(server_fd, 10);
+    
+    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0 || listen(server_fd, 10) < 0) {
+        std::cerr << "CRITICAL: Web Server port 8080 allocation failed." << std::endl;
+        return;
+    }
 
     while (true) {
         int client_socket = accept(server_fd, nullptr, nullptr);
@@ -190,11 +250,11 @@ void httpServerThread() {
 
         if (req.find("GET /data") != std::string::npos) {
             std::lock_guard<std::mutex> lock(stateMutex);
-            char json[256];
+            char json[512]; 
             snprintf(json, sizeof(json), 
                      "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
-                     "{\"x\":%.2f,\"y\":%.2f,\"d1\":%.2f,\"d2\":%.2f,\"d3\":%.2f,\"r1\":%d,\"r2\":%d,\"r3\":%d}",
-                     state.x, state.y, state.d1, state.d2, state.d3, state.rssi1, state.rssi2, state.rssi3);
+                     "{\"x\":%.2f,\"y\":%.2f,\"z\":%.2f,\"d1\":%.2f,\"d2\":%.2f,\"d3\":%.2f,\"r1\":%d,\"r2\":%d,\"r3\":%d}",
+                     state.x, state.y, state.z, state.d1, state.d2, state.d3, state.rssi1, state.rssi2, state.rssi3);
             write(client_socket, json, strlen(json));
         } else {
             write(client_socket, HTML_PAGE.c_str(), HTML_PAGE.length());
@@ -203,10 +263,17 @@ void httpServerThread() {
     }
 }
 
+// ==========================================
+// 6. MAIN EXECUTION
+// ==========================================
 int main() {
-    std::thread ble(bluetoothSnifferThread);
-    std::thread http(httpServerThread);
-    ble.join();
-    http.join();
+    std::cout << "Initializing LumenTrack Native 3D Infrastructure..." << std::endl;
+
+    std::thread bleWorker(bluetoothSnifferThread);
+    std::thread httpWorker(httpServerThread);
+
+    bleWorker.join();
+    httpWorker.join();
+
     return 0;
 }
