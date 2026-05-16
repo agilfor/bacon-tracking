@@ -93,6 +93,8 @@ void bluetoothSnifferThread() {
             char mac[18];
             ba2str(&info->bdaddr, mac);
 
+            std::cout << "Radio Heard MAC: " << mac << std::endl;
+
             // RSSI is always exactly one byte after the payload data ends
             int8_t rawRssi = (int8_t)info->data[info->length];
 
