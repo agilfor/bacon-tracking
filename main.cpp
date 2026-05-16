@@ -80,7 +80,7 @@ void bluetoothSnifferThread() {
     hci_le_set_scan_enable(dd, 0x00, 0x00, 1000); 
     uint16_t interval = htobs(0x0010), window = htobs(0x0010);
     hci_le_set_scan_parameters(dd, 0x00, interval, window, 0x00, 0x00, 1000);
-    hci_le_set_scan_enable(dd, 0x01, 0x00, 1000); // 0x00 = Duplicate filtering OFF
+    hci_le_set_scan_enable(dd, 0x01, 0x00, 1000);
 
     struct hci_filter nf;
     hci_filter_clear(&nf);
@@ -89,7 +89,7 @@ void bluetoothSnifferThread() {
     setsockopt(dd, SOL_HCI, HCI_FILTER, &nf, sizeof(nf));
 
     uint8_t buf[HCI_MAX_FRAME_SIZE];
-    std::cout << "[BLE] Engine running. Waiting for all 3 beacons to sync...\n";
+    std::cout << "[BLE] Engine running. Dashboard available on port 8080.\n";
 
     while (true) {
         int len = read(dd, buf, sizeof(buf));
@@ -121,10 +121,6 @@ void bluetoothSnifferThread() {
 
             if (updated) {
                 executeTrilateration();
-                // Cleanly update a single line in the terminal
-                printf("\r[STAGE X: %5.2f Y: %5.2f] | B1: %5.2fm | B2: %5.2fm | B3: %5.2fm    ", 
-                       state.x, state.y, state.d1, state.d2, state.d3);
-                fflush(stdout);
             }
 
             ptr += (sizeof(le_advertising_info) + info->length + 1);
@@ -132,26 +128,43 @@ void bluetoothSnifferThread() {
     }
 }
 
-// --- WEB UI ---
+// --- SMART WEB UI ---
 const std::string HTML_PAGE = 
     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
     "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1.0'>"
     "<title>C++ Tracker Dashboard</title><style>"
-    "body{background-color:#121212;color:#00FF66;font-family:monospace;margin:30px;font-size:20px;}"
-    ".box{background-color:#1E1E1E;padding:20px;border-radius:8px;margin-bottom:15px;border:1px solid #333;}"
-    "h2{color:#00E5FF;margin-top:0;} .val{color:#FFF;font-weight:bold;font-size:28px;}"
+    "body{background-color:#121212;color:#E0E0E0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:20px;}"
+    ".box{background-color:#1E1E1E;padding:20px;border-radius:12px;margin-bottom:15px;border:1px solid #333;}"
+    "h1, h2{margin-top:0; color:#BB86FC;} .val{font-weight:bold;font-size:28px; color:#03DAC6;}"
+    "#status{padding:10px; border-radius:8px; font-weight:bold; text-align:center; margin-bottom:15px;}"
+    ".status-wait{background-color:#4A3500; color:#FFB300; border:1px solid #FFB300;}"
+    ".status-ready{background-color:#003314; color:#00FF66; border:1px solid #00FF66;}"
+    ".b-off{color:#CF6679; font-weight:bold;} .b-on{color:#E0E0E0;}"
     "</style></head><body>"
-    "<h1>🔮 LumenTrack Dashboard</h1>"
+    "<h1>🔮 LumenTrack Engine</h1>"
+    "<div id='status' class='status-wait'>⚠️ WAITING FOR BEACONS</div>"
     "<div class='box'><h2>Stage Coordinates</h2>"
-    "X: <span id='x' class='val'>0.00</span>m<br>Y: <span id='y' class='val'>0.00</span>m</div>"
-    "<div class='box'><h2>Beacon Distances</h2><div id='b' style='color:#FFF;'>Waiting...</div></div>"
+    "X: <span id='x' class='val'>---</span><br>Y: <span id='y' class='val'>---</span></div>"
+    "<div class='box'><h2>Hardware Status</h2><div id='b' style='font-family:monospace; font-size:18px; line-height:1.5;'>Loading...</div></div>"
     "<script>"
+    "function formatB(name, dist, rssi) {"
+    "  if(dist === 0) return `<span class='b-off'>${name} [OFFLINE]</span><br>`;"
+    "  return `<span class='b-on'>${name} [ACTIVE] : ${dist.toFixed(2)}m (${rssi}dBm)</span><br>`;"
+    "}"
     "async function poll(){"
     "try{let r=await fetch('/data');let d=await r.json();"
-    "document.getElementById('x').innerText=d.x.toFixed(2);"
-    "document.getElementById('y').innerText=d.y.toFixed(2);"
-    "document.getElementById('b').innerHTML="
-    "`B1: ${d.d1.toFixed(2)}m (${d.r1}dBm)<br>B2: ${d.d2.toFixed(2)}m (${d.r2}dBm)<br>B3: ${d.d3.toFixed(2)}m (${d.r3}dBm)`;"
+    "let ready = (d.d1 > 0 && d.d2 > 0 && d.d3 > 0);"
+    "let stat = document.getElementById('status');"
+    "if(ready) {"
+    "  stat.className='status-ready'; stat.innerText='✅ TRILATERATION ACTIVE';"
+    "  document.getElementById('x').innerText=d.x.toFixed(2) + 'm';"
+    "  document.getElementById('y').innerText=d.y.toFixed(2) + 'm';"
+    "} else {"
+    "  stat.className='status-wait'; stat.innerText='⚠️ WAITING FOR BEACONS';"
+    "  document.getElementById('x').innerText='---';"
+    "  document.getElementById('y').innerText='---';"
+    "}"
+    "document.getElementById('b').innerHTML = formatB('B1', d.d1, d.r1) + formatB('B2', d.d2, d.r2) + formatB('B3', d.d3, d.r3);"
     "}catch(e){}}setInterval(poll,100);"
     "</script></body></html>";
 
