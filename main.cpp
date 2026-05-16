@@ -17,8 +17,8 @@
 
 // --- CONFIGURATION ---
 const char* BEACON_1_MAC = "48:87:2d:7c:f1:07";
-const char* BEACON_2_MAC = "48:87:2d:7c:f0:fc"; // Change to your Beacon 2
-const char* BEACON_3_MAC = "48:87:2d:7c:f0:ff"; // Change to your Beacon 3
+const char* BEACON_2_MAC = "48:87:2d:7c:f0:fc";
+const char* BEACON_3_MAC = "48:87:2d:7c:f0:ff";
 
 float RSSI_AT_1M = -57.0f;
 float N_VALUE = 2.0f;
@@ -54,7 +54,7 @@ PureKalman filter1, filter2, filter3;
 
 // --- MATH ---
 float rssiToMeters(int rssi) {
-    if (rssi == 0) return 0.0f;
+    if (rssi >= 0 || rssi < -120) return 0.0f; // Filter out invalid readings
     return std::pow(10.0f, (RSSI_AT_1M - (float)rssi) / (10.0f * N_VALUE));
 }
 
@@ -63,9 +63,9 @@ void executeTrilateration() {
     float r2 = state.d2;
     float r3 = state.d3;
 
+    // If we haven't seen all three beacons yet, don't calculate coordinates
     if (r1 == 0.0f || r2 == 0.0f || r3 == 0.0f) return;
 
-    // Fixed Stage coordinates for your anchors
     float x1 = 0.0f, y1 = 0.0f;
     float x2 = 8.0f, y2 = 0.0f;
     float x3 = 4.0f, y3 = 6.0f;
@@ -94,7 +94,6 @@ void bluetoothSnifferThread() {
         return;
     }
 
-    // Set HCI Filter to only intercept LE Advertising Packets
     struct hci_filter nf;
     hci_filter_clear(&nf);
     hci_filter_set_ptype(HCI_EVENT_PKT, &nf);
@@ -112,7 +111,6 @@ void bluetoothSnifferThread() {
         int len = read(dd, buf, sizeof(buf));
         if (len <= 0) continue;
 
-        // Navigate the binary byte structure of an LE advertising report packet
         evt_le_meta_event* meta = (evt_le_meta_event*)(buf + (1 + HCI_EVENT_HDR_SIZE));
         if (meta->subevent != EVT_LE_ADVERTISING_REPORT) continue;
 
@@ -121,29 +119,39 @@ void bluetoothSnifferThread() {
         char mac[18];
         ba2str(&info->bdaddr, mac);
         
-        // Read the last data byte layout position which explicitly contains RSSI signature
-        int8_t rawRssi = (int8_t)(*(meta->data + 1 + (1 + info->length)));
+        // FIX: Cast to a raw uint8_t byte array before calculating offsets.
+        // The structural header of le_advertising_info spans exactly 9 bytes before the payload array.
+        uint8_t* raw_packet_bytes = (uint8_t*)info;
+        int8_t rawRssi = (int8_t)raw_packet_bytes[9 + info->length];
 
         {
             std::lock_guard<std::mutex> lock(stateMutex);
             if (!state.running) continue;
 
             float rawDist = rssiToMeters((int)rawRssi);
+            bool match = false;
 
             if (strcasecmp(mac, BEACON_1_MAC) == 0) {
                 state.rssi1 = rawRssi;
                 state.d1 = filter1.update(rawDist);
+                match = true;
             } else if (strcasecmp(mac, BEACON_2_MAC) == 0) {
                 state.rssi2 = rawRssi;
                 state.d2 = filter2.update(rawDist);
+                match = true;
             } else if (strcasecmp(mac, BEACON_3_MAC) == 0) {
                 state.rssi3 = rawRssi;
                 state.d3 = filter3.update(rawDist);
-            } else {
-                continue; // Ignore any background non-beacon devices
+                match = true;
             }
 
-            executeTrilateration();
+            // LIVE CONSOLE DEBUG PRINT
+            if (match) {
+                std::cout << "[TARGET SPOTTED] MAC: " << mac 
+                          << " | Raw RSSI: " << (int)rawRssi 
+                          << " | Distance: " << rawDist << "m" << std::endl;
+                executeTrilateration();
+            }
         }
     }
     close(dd);
@@ -236,11 +244,9 @@ void httpServerThread() {
 int main() {
     std::cout << "Initializing Native C++ Coordinate Translation Infrastructure..." << std::endl;
 
-    // Fire processing core threads
     std::thread bleWorker(bluetoothSnifferThread);
     std::thread httpWorker(httpServerThread);
 
-    // Keep the main binary context executing indefinitely
     bleWorker.join();
     httpWorker.join();
 
