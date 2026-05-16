@@ -7,21 +7,28 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
-// Linux Bluetooth Headers
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/hci.h>
 #include <bluetooth/hci_lib.h>
 
 // --- CONFIGURATION ---
-const char* TARGET_MAC = "48:87:2d:7c:f1:07"; // <--- Put your ONE beacon MAC here
+const char* BEACONS[3] = {
+    "48:87:2D:7C:F1:07", // Beacon 1
+    "48:87:2D:7C:F0:FF", // Beacon 2
+    "48:87:2D:7C:F0:FC"  // Beacon 3
+};
+
 float RSSI_AT_1M = -57.0f;
 float N_VALUE = 2.0f;
 
 // --- STATE ---
+struct TrackingState {
+    float x = 0.0f, y = 0.0f;
+    float d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+    int rssi1 = 0, rssi2 = 0, rssi3 = 0;
+};
+TrackingState state;
 std::mutex stateMutex;
-float current_distance = 0.0f;
-int current_rssi = 0;
-bool is_running = true;
 
 // --- KALMAN FILTER ---
 class PureKalman {
@@ -35,11 +42,34 @@ public:
         return current_est;
     }
 };
-PureKalman filter;
+PureKalman filter1, filter2, filter3;
 
 float rssiToMeters(int rssi) {
     if (rssi >= 0 || rssi < -120) return 0.0f; 
     return std::pow(10.0f, (RSSI_AT_1M - (float)rssi) / (10.0f * N_VALUE));
+}
+
+// --- MATH ---
+void executeTrilateration() {
+    float r1 = state.d1, r2 = state.d2, r3 = state.d3;
+    if (r1 == 0.0f || r2 == 0.0f || r3 == 0.0f) return;
+
+    float x1 = 0.0f, y1 = 0.0f;
+    float x2 = 8.0f, y2 = 0.0f;
+    float x3 = 4.0f, y3 = 6.0f;
+
+    float A = 2.0f * x2 - 2.0f * x1;
+    float B = 2.0f * y2 - 2.0f * y1;
+    float C = (r1*r1) - (r2*r2) - (x1*x1) + (x2*x2) - (y1*y1) + (y2*y2);
+    float D = 2.0f * x3 - 2.0f * x2;
+    float E = 2.0f * y3 - 2.0f * y2;
+    float F = (r2*r2) - (r3*r3) - (x2*x2) + (x3*x3) - (y2*y2) + (y3*y3);
+
+    float denominator = (E * A - B * D);
+    if (std::abs(denominator) < 0.0001f) return;
+
+    state.x = (C * E - F * B) / denominator;
+    state.y = (C * D - A * F) / (B * D - A * E);
 }
 
 // --- BLUETOOTH CORE ---
@@ -47,26 +77,10 @@ void bluetoothSnifferThread() {
     int device_id = hci_get_route(NULL);
     int dd = hci_open_dev(device_id);
     
-    if (device_id < 0 || dd < 0) {
-        std::cerr << "CRITICAL: Could not open Bluetooth Device." << std::endl;
-        return;
-    }
-
-    std::cout << "[BLE] Configuring Radio for Active Unfiltered Scanning..." << std::endl;
-
-    // 1. Force the scanner off before configuring
     hci_le_set_scan_enable(dd, 0x00, 0x00, 1000); 
-
-    // 2. Set scan parameters
-    uint16_t interval = htobs(0x0010); // Very aggressive scan interval
-    uint16_t window = htobs(0x0010);
+    uint16_t interval = htobs(0x0010), window = htobs(0x0010);
     hci_le_set_scan_parameters(dd, 0x00, interval, window, 0x00, 0x00, 1000);
-
-    // 3. Enable scanner WITH DUPLICATE FILTERING DISABLED (0x00)
-    if (hci_le_set_scan_enable(dd, 0x01, 0x00, 1000) < 0) {
-        std::cerr << "CRITICAL: Failed to enable hardware scanner. Is bluetoothctl running?" << std::endl;
-        return;
-    }
+    hci_le_set_scan_enable(dd, 0x01, 0x00, 1000); // 0x00 = Duplicate filtering OFF
 
     struct hci_filter nf;
     hci_filter_clear(&nf);
@@ -75,7 +89,7 @@ void bluetoothSnifferThread() {
     setsockopt(dd, SOL_HCI, HCI_FILTER, &nf, sizeof(nf));
 
     uint8_t buf[HCI_MAX_FRAME_SIZE];
-    std::cout << "[BLE] Success. Listening for MAC: " << TARGET_MAC << std::endl;
+    std::cout << "[BLE] Engine running. Waiting for all 3 beacons to sync...\n";
 
     while (true) {
         int len = read(dd, buf, sizeof(buf));
@@ -84,7 +98,6 @@ void bluetoothSnifferThread() {
         evt_le_meta_event* meta = (evt_le_meta_event*)(buf + (1 + HCI_EVENT_HDR_SIZE));
         if (meta->subevent != EVT_LE_ADVERTISING_REPORT) continue;
 
-        // Parse through the raw LE report memory block properly
         uint8_t num_reports = meta->data[0];
         uint8_t* ptr = meta->data + 1;
 
@@ -92,44 +105,53 @@ void bluetoothSnifferThread() {
             le_advertising_info* info = (le_advertising_info*)ptr;
             char mac[18];
             ba2str(&info->bdaddr, mac);
-
-            std::cout << "Radio Heard MAC: " << mac << std::endl;
-
-            // RSSI is always exactly one byte after the payload data ends
             int8_t rawRssi = (int8_t)info->data[info->length];
 
-            if (strcasecmp(mac, TARGET_MAC) == 0) {
-                std::lock_guard<std::mutex> lock(stateMutex);
-                current_rssi = rawRssi;
-                float rawDist = rssiToMeters((int)rawRssi);
-                current_distance = filter.update(rawDist);
+            std::lock_guard<std::mutex> lock(stateMutex);
+            float rawDist = rssiToMeters((int)rawRssi);
+            bool updated = false;
 
-                std::cout << "🎯 BEACON FOUND! RSSI: " << current_rssi 
-                          << " | Smooth Dist: " << current_distance << "m" << std::endl;
+            if (strcasecmp(mac, BEACONS[0]) == 0) {
+                state.rssi1 = rawRssi; state.d1 = filter1.update(rawDist); updated = true;
+            } else if (strcasecmp(mac, BEACONS[1]) == 0) {
+                state.rssi2 = rawRssi; state.d2 = filter2.update(rawDist); updated = true;
+            } else if (strcasecmp(mac, BEACONS[2]) == 0) {
+                state.rssi3 = rawRssi; state.d3 = filter3.update(rawDist); updated = true;
             }
 
-            // Jump memory pointer to the next report in the packet
+            if (updated) {
+                executeTrilateration();
+                // Cleanly update a single line in the terminal
+                printf("\r[STAGE X: %5.2f Y: %5.2f] | B1: %5.2fm | B2: %5.2fm | B3: %5.2fm    ", 
+                       state.x, state.y, state.d1, state.d2, state.d3);
+                fflush(stdout);
+            }
+
             ptr += (sizeof(le_advertising_info) + info->length + 1);
         }
     }
-    close(dd);
 }
 
-// --- MINIMAL WEB UI ---
+// --- WEB UI ---
 const std::string HTML_PAGE = 
     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
     "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1.0'>"
-    "<title>Single Beacon Test</title><style>"
-    "body{background-color:#0A0A0A;color:#00FF66;font-family:monospace;margin:30px;font-size:24px;text-align:center;}"
+    "<title>C++ Tracker Dashboard</title><style>"
+    "body{background-color:#121212;color:#00FF66;font-family:monospace;margin:30px;font-size:20px;}"
+    ".box{background-color:#1E1E1E;padding:20px;border-radius:8px;margin-bottom:15px;border:1px solid #333;}"
+    "h2{color:#00E5FF;margin-top:0;} .val{color:#FFF;font-weight:bold;font-size:28px;}"
     "</style></head><body>"
-    "<h1>📡 Beacon Tracker</h1>"
-    "<div>Distance: <span id='d'>0.00</span>m</div>"
-    "<div style='font-size:16px;color:#888;'>RSSI: <span id='r'>0</span> dBm</div>"
+    "<h1>🔮 LumenTrack Dashboard</h1>"
+    "<div class='box'><h2>Stage Coordinates</h2>"
+    "X: <span id='x' class='val'>0.00</span>m<br>Y: <span id='y' class='val'>0.00</span>m</div>"
+    "<div class='box'><h2>Beacon Distances</h2><div id='b' style='color:#FFF;'>Waiting...</div></div>"
     "<script>"
     "async function poll(){"
-    "try{let res=await fetch('/data');let data=await res.json();"
-    "document.getElementById('d').innerText=data.dist.toFixed(2);"
-    "document.getElementById('r').innerText=data.rssi;"
+    "try{let r=await fetch('/data');let d=await r.json();"
+    "document.getElementById('x').innerText=d.x.toFixed(2);"
+    "document.getElementById('y').innerText=d.y.toFixed(2);"
+    "document.getElementById('b').innerHTML="
+    "`B1: ${d.d1.toFixed(2)}m (${d.r1}dBm)<br>B2: ${d.d2.toFixed(2)}m (${d.r2}dBm)<br>B3: ${d.d3.toFixed(2)}m (${d.r3}dBm)`;"
     "}catch(e){}}setInterval(poll,100);"
     "</script></body></html>";
 
@@ -155,9 +177,12 @@ void httpServerThread() {
 
         if (req.find("GET /data") != std::string::npos) {
             std::lock_guard<std::mutex> lock(stateMutex);
-            std::string json = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
-                               "{\"dist\":" + std::to_string(current_distance) + ",\"rssi\":" + std::to_string(current_rssi) + "}";
-            write(client_socket, json.c_str(), json.length());
+            char json[256];
+            snprintf(json, sizeof(json), 
+                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                     "{\"x\":%.2f,\"y\":%.2f,\"d1\":%.2f,\"d2\":%.2f,\"d3\":%.2f,\"r1\":%d,\"r2\":%d,\"r3\":%d}",
+                     state.x, state.y, state.d1, state.d2, state.d3, state.rssi1, state.rssi2, state.rssi3);
+            write(client_socket, json, strlen(json));
         } else {
             write(client_socket, HTML_PAGE.c_str(), HTML_PAGE.length());
         }
